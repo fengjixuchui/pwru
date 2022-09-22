@@ -35,7 +35,11 @@ func NewOutput(flags *Flags, printSkbMap *ebpf.Map, printStackMap *ebpf.Map, add
 }
 
 func (o *output) PrintHeader() {
-	fmt.Printf("%18s %16s %24s %16s\n", "SKB", "PROCESS", "FUNC", "TIMESTAMP")
+	fmt.Printf("%18s %6s %16s %24s", "SKB", "CPU", "PROCESS", "FUNC")
+	if o.flags.OutputTS != "none" {
+		fmt.Printf(" %16s", "TIMESTAMP")
+	}
+	fmt.Printf("\n")
 }
 
 func (o *output) Print(event *Event) {
@@ -45,7 +49,7 @@ func (o *output) Print(event *Event) {
 		execName = p.Executable()
 	}
 	ts := event.Timestamp
-	if o.flags.OutputRelativeTS {
+	if o.flags.OutputTS == "relative" {
 		if last, found := o.lastSeenSkb[event.SAddr]; found {
 			ts = ts - last
 		} else {
@@ -63,10 +67,18 @@ func (o *output) Print(event *Event) {
 	var funcName string
 	if ksym, ok := o.addr2name.Addr2NameMap[addr]; ok {
 		funcName = ksym.name
+	} else if ksym, ok := o.addr2name.Addr2NameMap[addr-4]; runtime.GOARCH == "amd64" && ok {
+		// Assume that function has ENDBR in its prelude (enabled by CONFIG_X86_KERNEL_IBT).
+		// See https://lore.kernel.org/bpf/20220811091526.172610-5-jolsa@kernel.org/
+		// for more ctx.
+		funcName = ksym.name
 	} else {
 		funcName = fmt.Sprintf("0x%x", addr)
 	}
-	fmt.Printf("%18s %16s %24s %16d", fmt.Sprintf("0x%x", event.SAddr), fmt.Sprintf("[%s]", execName), funcName, ts)
+	fmt.Printf("%18s %6s %16s %24s", fmt.Sprintf("0x%x", event.SAddr), fmt.Sprintf("%d", event.CPU), fmt.Sprintf("[%s]", execName), funcName)
+	if o.flags.OutputTS != "none" {
+		fmt.Printf(" %16d", ts)
+	}
 	o.lastSeenSkb[event.SAddr] = event.Timestamp
 
 	if o.flags.OutputMeta {
