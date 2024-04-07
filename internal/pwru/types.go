@@ -1,32 +1,38 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (C) 2020-2021 Martynas Pumputis */
-/* Copyright (C) 2021-2022 Authors of Cilium */
+// SPDX-License-Identifier: Apache-2.0
+/* Copyright Martynas Pumputis */
+/* Copyright Authors of Cilium */
 
 package pwru
 
 import (
+	"fmt"
 	"os"
+	"strings"
 
 	flag "github.com/spf13/pflag"
 )
 
 const (
 	MaxStackDepth = 50
+
+	BackendKprobe      = "kprobe"
+	BackendKprobeMulti = "kprobe-multi"
 )
 
 type Flags struct {
 	ShowVersion bool
+	ShowHelp    bool
 
 	KernelBTF string
 
-	FilterNetns   uint32
-	FilterMark    uint32
-	FilterFunc    string
-	FilterProto   string
-	FilterSrcIP   string
-	FilterDstIP   string
-	FilterSrcPort uint16
-	FilterDstPort uint16
+	FilterNetns       string
+	FilterMark        uint32
+	FilterFunc        string
+	FilterTrackSkb    bool
+	FilterTraceTc     bool
+	FilterIfname      string
+	FilterPcap        string
+	FilterKprobeBatch uint
 
 	OutputTS         string
 	OutputMeta       bool
@@ -34,30 +40,62 @@ type Flags struct {
 	OutputSkb        bool
 	OutputStack      bool
 	OutputLimitLines uint64
+	OutputFile       string
+	OutputJson       bool
 
-	PerCPUBuffer int
-	KMods        []string
+	KMods    []string
+	AllKMods bool
+
+	ReadyFile string
+
+	Backend string
 }
 
 func (f *Flags) SetFlags() {
+	flag.BoolVarP(&f.ShowHelp, "help", "h", false, "display this message and exit")
 	flag.BoolVar(&f.ShowVersion, "version", false, "show pwru version and exit")
 	flag.StringVar(&f.KernelBTF, "kernel-btf", "", "specify kernel BTF file")
 	flag.StringSliceVar(&f.KMods, "kmods", nil, "list of kernel modules names to attach to")
+	flag.BoolVar(&f.AllKMods, "all-kmods", false, "attach to all available kernel modules")
 	flag.StringVar(&f.FilterFunc, "filter-func", "", "filter kernel functions to be probed by name (exact match, supports RE2 regular expression)")
-	flag.StringVar(&f.FilterProto, "filter-proto", "", "filter L4 protocol (tcp, udp, icmp, icmp6)")
-	flag.StringVar(&f.FilterSrcIP, "filter-src-ip", "", "filter source IP addr")
-	flag.StringVar(&f.FilterDstIP, "filter-dst-ip", "", "filter destination IP addr")
-	flag.Uint32Var(&f.FilterNetns, "filter-netns", 0, "filter netns inode")
+	flag.StringVar(&f.FilterNetns, "filter-netns", "", "filter netns (\"/proc/<pid>/ns/net\", \"inode:<inode>\")")
 	flag.Uint32Var(&f.FilterMark, "filter-mark", 0, "filter skb mark")
-	flag.Uint16Var(&f.FilterSrcPort, "filter-src-port", 0, "filter source port")
-	flag.Uint16Var(&f.FilterDstPort, "filter-dst-port", 0, "filter destination port")
-	flag.StringVar(&f.OutputTS, "timestamp", "none", "print timestamp per skb (\"current\", \"relative\", \"none\")")
+	flag.BoolVar(&f.FilterTrackSkb, "filter-track-skb", false, "trace a packet even if it does not match given filters (e.g., after NAT or tunnel decapsulation)")
+	flag.BoolVar(&f.FilterTraceTc, "filter-trace-tc", false, "trace TC bpf progs")
+	flag.StringVar(&f.FilterIfname, "filter-ifname", "", "filter skb ifname in --filter-netns (if not specified, use current netns)")
+	flag.UintVar(&f.FilterKprobeBatch, "filter-kprobe-batch", 10, "batch size for kprobe attaching/detaching")
+	flag.StringVar(&f.OutputTS, "timestamp", "none", "print timestamp per skb (\"current\", \"relative\", \"absolute\", \"none\")")
 	flag.BoolVar(&f.OutputMeta, "output-meta", false, "print skb metadata")
 	flag.BoolVar(&f.OutputTuple, "output-tuple", false, "print L4 tuple")
 	flag.BoolVar(&f.OutputSkb, "output-skb", false, "print skb")
 	flag.BoolVar(&f.OutputStack, "output-stack", false, "print stack")
 	flag.Uint64Var(&f.OutputLimitLines, "output-limit-lines", 0, "exit the program after the number of events has been received/printed")
-	flag.IntVar(&f.PerCPUBuffer, "per-cpu-buffer", os.Getpagesize(), "per CPU buffer in bytes")
+
+	flag.StringVar(&f.OutputFile, "output-file", "", "write traces to file")
+
+	flag.BoolVar(&f.OutputJson, "output-json", false, "output traces in JSON format")
+
+	flag.StringVar(&f.ReadyFile, "ready-file", "", "create file after all BPF progs are attached")
+	flag.Lookup("ready-file").Hidden = true
+
+	flag.StringVar(&f.Backend, "backend", "",
+		fmt.Sprintf("Tracing backend('%s', '%s'). Will auto-detect if not specified.", BackendKprobe, BackendKprobeMulti))
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] [pcap-filter]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "    Available pcap-filter: see \"man 7 pcap-filter\"\n")
+		fmt.Fprintf(os.Stderr, "    Available options:\n")
+		flag.PrintDefaults()
+	}
+}
+
+func (f *Flags) PrintHelp() {
+	flag.Usage()
+}
+
+func (f *Flags) Parse() {
+	flag.Parse()
+	f.FilterPcap = strings.Join(flag.Args(), " ")
 }
 
 type Tuple struct {
@@ -94,5 +132,6 @@ type Event struct {
 	Meta         Meta
 	Tuple        Tuple
 	PrintStackId int64
+	ParamSecond  uint64
 	CPU          uint32
 }

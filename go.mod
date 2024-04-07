@@ -1,22 +1,33 @@
 module github.com/cilium/pwru
 
-go 1.18
+go 1.21.0
+
+toolchain go1.21.6
 
 require (
-	github.com/cheggaaa/pb/v3 v3.1.0
-	github.com/cilium/ebpf v0.9.2
-	github.com/mitchellh/go-ps v1.0.0
+	github.com/cheggaaa/pb/v3 v3.1.5
+	github.com/cilium/ebpf v0.13.2
+	github.com/cloudflare/cbpfc v0.0.0-20221017140110-11acb56438a2
+	github.com/jsimonetti/rtnetlink v1.4.1
 	github.com/spf13/pflag v1.0.5
-	golang.org/x/sys v0.0.0-20220829200755-d48e67d00261
+	github.com/tklauser/ps v0.0.2
+	github.com/vishvananda/netns v0.0.4
+	golang.org/x/net v0.21.0
+	golang.org/x/sync v0.6.0
+	golang.org/x/sys v0.18.0
 )
 
 require (
-	github.com/VividCortex/ewma v1.1.1 // indirect
-	github.com/fatih/color v1.13.0 // indirect
-	github.com/mattn/go-colorable v0.1.11 // indirect
-	github.com/mattn/go-isatty v0.0.14 // indirect
-	github.com/mattn/go-runewidth v0.0.12 // indirect
+	github.com/VividCortex/ewma v1.2.0 // indirect
+	github.com/fatih/color v1.15.0 // indirect
+	github.com/google/go-cmp v0.6.0 // indirect
+	github.com/josharian/native v1.1.0 // indirect
+	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/mattn/go-isatty v0.0.19 // indirect
+	github.com/mattn/go-runewidth v0.0.15 // indirect
+	github.com/mdlayher/netlink v1.7.2 // indirect
+	github.com/mdlayher/socket v0.4.1 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/rivo/uniseg v0.2.0 // indirect
-	github.com/rogpeppe/go-internal v1.8.0 // indirect
-	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
+	golang.org/x/exp v0.0.0-20240213143201-ec583247a57a // indirect
 )

@@ -9,22 +9,16 @@ RUN apt update -y -q && \
         ca-certificates \
         wget \
         gnupg2 \
-        git && \
-    curl -s https://storage.googleapis.com/golang/go1.18.3.linux-amd64.tar.gz| tar -v -C /usr/local -xz && \
-    printf "deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-12 main" | tee /etc/apt/sources.list.d/llvm-toolchain-xenial-12.list && \
-    wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add - && \
-    apt -y update && \
-    apt install --no-install-recommends -y -q \
-        llvm-12 \
-        clang-12 && \
-    ln -s /usr/bin/clang-12 /usr/bin/clang && \
-    ln -s /usr/lib/llvm-12/bin/llvm-strip /usr/local/bin/llvm-strip
+        git \
+        llvm \
+        clang \
+        gcc flex bison gcc-aarch64* libc6-dev-arm64-cross && \
+    curl -s https://storage.googleapis.com/golang/go1.20.5.linux-amd64.tar.gz | tar -v -C /usr/local -xz
 
 WORKDIR /pwru
 COPY . .
 RUN make && \
     chmod a+x /pwru
 
-FROM scratch
+FROM busybox
 COPY --from=build /pwru/pwru /usr/local/bin/
-ENTRYPOINT ["/usr/local/bin/pwru"]

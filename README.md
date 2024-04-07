@@ -1,5 +1,8 @@
 # pwru (packet, where are you?)
 
+[![Build and Test](https://github.com/cilium/pwru/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cilium/pwru/actions/workflows/test.yml)
+[![GitHub Release](https://img.shields.io/github/release/cilium/pwru.svg?style=flat)](https://github.com/cilium/pwru/releases/latest)
+
 ![logo](logo.png "Detective Gopher is looking for packet traces left by eBPF bee")
 
 `pwru` is an [eBPF](https://ebpf.io)-based tool for tracing network packets in
@@ -15,52 +18,61 @@ after installing an IP tables rule:
 
 ### Requirements
 
-`pwru` requires >= 5.3 kernel to run. For `--output-skb` >= 5.9 kernel is required.
+`pwru` requires >= 5.3 kernel to run. For `--output-skb` >= 5.9 kernel is required. For `--backend=kprobe-multi` >= 5.18 kernel is required.
+
+`debugfs` has to be mounted in `/sys/kernel/debug`. In case the folder is empty, it can be mounted with:
+
+```
+mount -t debugfs none /sys/kernel/debug
+```
 
 The following kernel configuration is required.
 
-|           Option        |        Note            |
-| ----------------------- | ---------------------- |
-| CONFIG_DEBUG_INFO_BTF=y | Available since >= 5.3 |
-| CONFIG_KPROBES=y        |                        |
-| CONFIG_PERF_EVENTS=y    |                        |
-| CONFIG_BPF=y            |                        |
-| CONFIG_BPF_SYSCALL=y    |                        |
+|           Option         | Backend      |                   Note                               |
+| ------------------------ | -------------|----------------------------------------------------- |
+| CONFIG_DEBUG_INFO_BTF=y  | both         | available since >= 5.3                               |
+| CONFIG_KPROBES=y         | both         |                                                      |
+| CONFIG_PERF_EVENTS=y     | both         |                                                      |
+| CONFIG_BPF=y             | both         |                                                      |
+| CONFIG_BPF_SYSCALL=y     | both         |                                                      |
+| CONFIG_FUNCTION_TRACER=y | kprobe-multi | /sys/kernel/debug/tracing/available_filter_functions |
+| CONFIG_FPROBE=y          | kprobe-multi | available since >= 5.18                              |
 
 You can use `zgrep $OPTION /proc/config.gz` to validate whether option is enabled.
 
 ### Downloading
 
-You can download the statically linked executable for x86\_64 and amd64 from the
+You can download the statically linked executable for x86\_64 and arm64 from the
 [release page](https://github.com/cilium/pwru/releases).
 
 ### Usage
 
 ```
-$ pwru --help
-Usage of ./pwru:
-      --filter-dst-ip string      filter destination IP addr
-      --filter-dst-port uint16    filter destination port
+$ ./pwru --help
+Usage: pwru [options] [pcap-filter]
+    Available pcap-filter: see "man 7 pcap-filter"
+    Available options:
+      --all-kmods                 attach to all available kernel modules
+      --backend string            Tracing backend('kprobe', 'kprobe-multi'). Will auto-detect if not specified.
       --filter-func string        filter kernel functions to be probed by name (exact match, supports RE2 regular expression)
+      --filter-ifname string      filter skb ifname in --filter-netns (if not specified, use current netns)
+      --filter-kprobe-batch uint  batch size for kprobe attaching/detaching (default 10)
       --filter-mark uint32        filter skb mark
-      --filter-netns uint32       filter netns inode
-      --filter-proto string       filter L4 protocol (tcp, udp, icmp, icmp6)
-      --filter-src-ip string      filter source IP addr
-      --filter-src-port uint16    filter source port
+      --filter-netns string       filter netns ("/proc/<pid>/ns/net", "inode:<inode>")
+      --filter-trace-tc           trace TC bpf progs
+      --filter-track-skb          trace a packet even if it does not match given filters (e.g., after NAT or tunnel decapsulation)
+  -h, --help                      display this message and exit
       --kernel-btf string         specify kernel BTF file
       --kmods strings             list of kernel modules names to attach to
+      --output-file string        write traces to file
       --output-limit-lines uint   exit the program after the number of events has been received/printed
       --output-meta               print skb metadata
       --output-skb                print skb
       --output-stack              print stack
       --output-tuple              print L4 tuple
-      --per-cpu-buffer int        per CPU buffer in bytes (default 4096)
-      --timestamp string          print timestamp per skb ("current", "relative", "none") (default "none")
+      --timestamp string          print timestamp per skb ("current", "relative", "absolute", "none") (default "none")
       --version                   show pwru version and exit
 ```
-
-If multiple filters are specified, all of them have to match in order for a
-packet to be traced.
 
 The `--filter-func` switch does an exact match on function names i.e.
 `--filter-func=foo` only matches `foo()`; for a wildcarded match, try
@@ -73,63 +85,53 @@ Docker images for `pwru` are published at https://hub.docker.com/r/cilium/pwru.
 An example how to run `pwru` with Docker:
 
 ```
-docker run --privileged --rm -t --pid=host cilium/pwru --filter-dst-ip=1.1.1.1
+docker run --privileged --rm -t --pid=host -v /sys/kernel/debug/:/sys/kernel/debug/ cilium/pwru pwru --output-tuple 'host 1.1.1.1'
+```
+
+### Running on Kubernetes
+
+The following example shows how to run `pwru` on a given node:
+```
+#!/usr/bin/env bash
+NODE=kind-control-plane
+PWRU_ARGS="--output-tuple 'host 1.1.1.1'"
+
+trap " kubectl delete --wait=false pod pwru " EXIT
+
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pwru
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${NODE}
+  containers:
+  - image: docker.io/cilium/pwru:latest
+    name: pwru
+    volumeMounts:
+    - mountPath: /sys/kernel/debug
+      name: sys-kernel-debug
+    securityContext:
+      privileged: true
+    command: ["/bin/sh"]
+    args: ["-c", "pwru ${PWRU_ARGS}"]
+  volumes:
+  - name: sys-kernel-debug
+    hostPath:
+      path: /sys/kernel/debug
+      type: DirectoryOrCreate
+  hostNetwork: true
+  hostPID: true
+EOF
+
+kubectl wait pod pwru --for condition=Ready --timeout=90s
+kubectl logs -f pwru
 ```
 
 ### Running on Vagrant
 
-If you have [Vagrant](https://www.vagrantup.com/) installed, you can run the
-above example with the following commands.
-
-1. In a terminal (terminal 1), bring up the Vagrant box:
-   ```console
-   $ vagrant up
-   ```
-   This will take a few minutes to download and provision the box.
-
-2. Connect to the Vagrant box:
-   ```console
-   $ vagrant ssh
-   ```
-
-3. Build `pwru`:
-   ```console
-   $ cd /pwru
-   $ make
-   ```
-
-4. Run `pwru`:
-   ```console
-   $ sudo ./pwru --filter-dst-ip=1.1.1.1 --filter-dst-port=80 --filter-proto=tcp --output-tuple
-   ```
-
-5. In a new terminal (terminal 2), connect to the Vagrant box:
-   ```console
-   $ vagrant ssh
-   ```
-
-6. In terminal 2, run `curl` to generate some traffic to 1.1.1.1:
-   ```console
-   $ curl 1.1.1.1
-   ```
-   Observe the output of `pwru` in terminal 1.
-
-7. In terminal 2, add an `iptables` rule to block traffic to 1.1.1.1:
-   ```console
-   $ sudo iptables -t filter -I OUTPUT 1 -m tcp --proto tcp --dst 1.1.1.1/32 -j DROP
-   ```
-
-8. In terminal 2, run `curl` to generate some traffic to 1.1.1.1:
-   ```console
-   $ curl 1.1.1.1
-   ```
-   Observe the output of `pwru` in terminal 1.
-
-9. To clean up, press `Ctrl+C` to terminate `pwru` in terminal 1, exit both
-   shells, and run:
-   ```console
-   $ vagrant destroy
-   ```
+See [docs/vagrant.md](docs/vagrant.md)
 
 ## Developing
 
@@ -137,6 +139,8 @@ above example with the following commands.
 
 * Go >= 1.16
 * LLVM/clang >= 1.12
+* Bison
+* Lex/Flex >= 2.5.31
 
 ### Building
 
@@ -152,11 +156,20 @@ make release
 
 ## Contributing
 
-`pwru` is an open source project licensed under [GPLv2](LICENSE). Everybody is
-welcome to contribute. Contributors are required to follow the
-[Contributor Covenant Code of Conduct](https://www.contributor-covenant.org/version/1/4/code-of-conduct/)
-and must adhere to the [Developer Certificate of Origin](https://developercertificate.org/)
-by adding a Signed-off-by line to their commit messages.
+`pwru` is an open source project. The userspace code is licensed under
+[Apache-2.0](LICENSE), while the BPF under [BSD 2-Clause](bpf/LICENSE.BSD-2-Clause)
+and [GPL-2.0](bpf/LICENSE.GPL-2.0). Everybody is welcome to contribute.
+Contributors are required to follow the [Contributor Covenant Code of
+Conduct](https://www.contributor-covenant.org/version/1/4/code-of-conduct/) and
+must adhere to the [Developer Certificate of
+Origin](https://developercertificate.org/) by adding a Signed-off-by line to
+their commit messages.
+
+## Community
+
+Join the `#pwru` [Slack channel](https://cilium.herokuapp.com/) to chat with
+developers, maintainers, and other users. This is a good first stop to ask
+questions and share your experiences.
 
 ## Logo Credits
 
