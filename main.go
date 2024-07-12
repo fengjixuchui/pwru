@@ -14,10 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	pb "github.com/cheggaaa/pb/v3"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
-	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 	"golang.org/x/sys/unix"
 
@@ -94,12 +92,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to get skb-accepting functions: %s", err)
 	}
-	if len(funcs) <= 0 {
+	if len(funcs) == 0 && !flags.FilterTraceTc && !flags.FilterTraceXdp {
 		log.Fatalf("Cannot find a matching kernel function")
 	}
-	// If --filter-trace-tc, it's to retrieve and print bpf prog's name.
+	// If --filter-trace-tc/--filter-trace-xdp, it's to retrieve and print bpf
+	// prog's name.
 	addr2name, name2addr, err := pwru.ParseKallsyms(funcs, flags.OutputStack ||
-		len(flags.KMods) != 0 || flags.FilterTraceTc)
+		len(flags.KMods) != 0 || flags.FilterTraceTc || flags.FilterTraceXdp ||
+		len(flags.FilterNonSkbFuncs) > 0 || flags.OutputCaller)
 	if err != nil {
 		log.Fatalf("Failed to get function addrs: %s", err)
 	}
@@ -111,9 +111,9 @@ func main() {
 
 	var bpfSpec *ebpf.CollectionSpec
 	switch {
-	case flags.OutputSkb && useKprobeMulti:
+	case (flags.OutputSkb || flags.OutputShinfo) && useKprobeMulti:
 		bpfSpec, err = LoadKProbeMultiPWRU()
-	case flags.OutputSkb:
+	case flags.OutputSkb || flags.OutputShinfo:
 		bpfSpec, err = LoadKProbePWRU()
 	case useKprobeMulti:
 		bpfSpec, err = LoadKProbeMultiPWRUWithoutOutputSKB()
@@ -126,9 +126,18 @@ func main() {
 
 	for name, program := range bpfSpec.Programs {
 		// Skip the skb-tracking ones that should not inject pcap-filter.
-		if name == "kprobe_skb_lifetime_termination" ||
-			name == "fexit_skb_clone" ||
-			name == "fexit_skb_copy" {
+		switch name {
+		case "kprobe_skb_lifetime_termination",
+			"fexit_skb_clone",
+			"fexit_skb_copy",
+			"kprobe_veth_convert_skb_to_xdp_buff",
+			"kretprobe_veth_convert_skb_to_xdp_buff":
+			continue
+		}
+		if name == "fentry_xdp" {
+			if err := libpcap.InjectL2Filter(program, flags.FilterPcap); err != nil {
+				log.Fatalf("Failed to inject filter ebpf for %s: %v", name, err)
+			}
 			continue
 		}
 		if err = libpcap.InjectFilters(program, flags.FilterPcap); err != nil {
@@ -147,33 +156,41 @@ func main() {
 	}
 
 	haveFexit := pwru.HaveBPFLinkTracing()
-	if flags.FilterTraceTc && !haveFexit {
-		log.Fatalf("Current kernel does not support fentry/fexit to run with --filter-trace-tc")
+	if (flags.FilterTraceTc || flags.FilterTraceXdp) && !haveFexit {
+		log.Fatalf("Current kernel does not support fentry/fexit to run with --filter-trace-tc/--filter-trace-xdp")
 	}
 
 	// As we know, for every fentry tracing program, there is a corresponding
 	// bpf prog spec with attaching target and attaching function. So, we can
-	// just copy the spec and keep the fentry_tc program spec only in the copied
-	// spec.
-	var bpfSpecFentry *ebpf.CollectionSpec
+	// just copy the spec and keep the fentry_tc/fentry_xdp program spec only in
+	// the copied spec.
+	var bpfSpecFentryTc *ebpf.CollectionSpec
 	if flags.FilterTraceTc {
-		bpfSpecFentry = bpfSpec.Copy()
-		bpfSpecFentry.Programs = map[string]*ebpf.ProgramSpec{
-			"fentry_tc": bpfSpec.Programs["fentry_tc"],
+		bpfSpecFentryTc = bpfSpec.Copy()
+		bpfSpecFentryTc.Programs = map[string]*ebpf.ProgramSpec{
+			"fentry_tc": bpfSpecFentryTc.Programs["fentry_tc"],
+		}
+	}
+	var bpfSpecFentryXdp *ebpf.CollectionSpec
+	if flags.FilterTraceXdp {
+		bpfSpecFentryXdp = bpfSpec.Copy()
+		bpfSpecFentryXdp.Programs = map[string]*ebpf.ProgramSpec{
+			"fentry_xdp": bpfSpecFentryXdp.Programs["fentry_xdp"],
 		}
 	}
 
-	// fentry_tc is not used in the kprobe/kprobe-multi cases. So, it should be
-	// deleted from the spec.
+	// fentry_tc&fentry_xdp are not used in the kprobe/kprobe-multi cases. So,
+	// they should be deleted from the spec.
 	delete(bpfSpec.Programs, "fentry_tc")
+	delete(bpfSpec.Programs, "fentry_xdp")
 
 	// If not tracking skb, deleting the skb-tracking programs to reduce loading
 	// time.
-	if !flags.FilterTrackSkb {
+	if !flags.FilterTrackSkb && !flags.FilterTrackSkbByStackid {
 		delete(bpfSpec.Programs, "kprobe_skb_lifetime_termination")
 	}
 
-	if !flags.FilterTrackSkb || !haveFexit {
+	if (!flags.FilterTrackSkb && !flags.FilterTrackSkbByStackid) || !haveFexit {
 		delete(bpfSpec.Programs, "fexit_skb_clone")
 		delete(bpfSpec.Programs, "fexit_skb_copy")
 	}
@@ -192,92 +209,38 @@ func main() {
 	}
 	defer coll.Close()
 
+	traceTc := false
 	if flags.FilterTraceTc {
-		close := pwru.TraceTC(coll, bpfSpecFentry, &opts, flags.OutputSkb, name2addr)
-		defer close()
+		t := pwru.TraceTC(coll, bpfSpecFentryTc, &opts, flags.OutputSkb, flags.OutputShinfo, name2addr)
+		defer t.Detach()
+		traceTc = t.HaveTracing()
 	}
 
-	var kprobes []link.Link
-	defer func() {
-		batch := uint(0)
-		if !useKprobeMulti {
-			batch = flags.FilterKprobeBatch
-		}
-		pwru.DetachKprobes(kprobes, batch)
-	}()
-
-	msg := "kprobe"
-	if useKprobeMulti {
-		msg = "kprobe-multi"
-	}
-	log.Printf("Attaching kprobes (via %s)...\n", msg)
-	ignored := 0
-	bar := pb.StartNew(len(funcs))
-
-	if flags.FilterTrackSkb {
-		kp, err := link.Kprobe("kfree_skbmem", coll.Programs["kprobe_skb_lifetime_termination"], nil)
-		bar.Increment()
-		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				log.Fatalf("Opening kprobe kfree_skbmem: %s\n", err)
-			} else {
-				ignored += 1
-				log.Printf("Warn: kfree_skbmem not found, pwru is likely to mismatch skb due to lack of skb lifetime management\n")
-			}
-		} else {
-			kprobes = append(kprobes, kp)
-		}
-
-		if haveFexit {
-			progs := []*ebpf.Program{
-				coll.Programs["fexit_skb_clone"],
-				coll.Programs["fexit_skb_copy"],
-			}
-			for _, prog := range progs {
-				fexit, err := link.AttachTracing(link.TracingOptions{
-					Program: prog,
-				})
-				bar.Increment()
-				if err != nil {
-					if !errors.Is(err, os.ErrNotExist) {
-						log.Fatalf("Opening tracing(%s): %s\n", prog, err)
-					} else {
-						ignored += 1
-					}
-				} else {
-					kprobes = append(kprobes, fexit)
-				}
-			}
-		}
+	traceXdp := false
+	if flags.FilterTraceXdp {
+		t := pwru.TraceXDP(coll, bpfSpecFentryXdp, &opts, flags.OutputSkb, flags.OutputShinfo, name2addr)
+		defer t.Detach()
+		traceXdp = t.HaveTracing()
 	}
 
-	pwruKprobes := make([]pwru.Kprobe, 0, len(funcs))
-	funcsByPos := pwru.GetFuncsByPos(funcs)
-	for pos, fns := range funcsByPos {
-		fn, ok := coll.Programs[fmt.Sprintf("kprobe_skb_%d", pos)]
-		if ok {
-			pwruKprobes = append(pwruKprobes, pwru.Kprobe{HookFuncs: fns, Prog: fn})
-		} else {
-			ignored += len(fns)
-			bar.Add(len(fns))
-		}
+	if !traceTc && !traceXdp && len(funcs) == 0 {
+		log.Fatalf("No kprobe/tc-bpf/xdp to trace!")
 	}
-	if !useKprobeMulti {
-		l, i := pwru.AttachKprobes(ctx, bar, pwruKprobes, flags.FilterKprobeBatch)
-		kprobes = append(kprobes, l...)
-		ignored += i
-	} else {
-		l, i := pwru.AttachKprobeMulti(ctx, bar, pwruKprobes, addr2name)
-		kprobes = append(kprobes, l...)
-		ignored += i
+
+	if flags.FilterTrackSkb || flags.FilterTrackSkbByStackid {
+		t := pwru.TrackSkb(coll, haveFexit, flags.FilterTrackSkb)
+		defer t.Detach()
 	}
-	bar.Finish()
-	select {
-	case <-ctx.Done():
-		return
-	default:
+
+	if nonSkbFuncs := flags.FilterNonSkbFuncs; len(nonSkbFuncs) != 0 {
+		k := pwru.NewNonSkbFuncsKprober(nonSkbFuncs, funcs, coll)
+		defer k.DetachKprobes()
 	}
-	log.Printf("Attached (ignored %d)\n", ignored)
+
+	if len(funcs) != 0 {
+		k := pwru.NewKprober(ctx, funcs, coll, addr2name, useKprobeMulti, flags.FilterKprobeBatch)
+		defer k.DetachKprobes()
+	}
 
 	log.Println("Listening for events..")
 
@@ -290,13 +253,13 @@ func main() {
 	}
 
 	printSkbMap := coll.Maps["print_skb_map"]
+	printShinfoMap := coll.Maps["print_shinfo_map"]
 	printStackMap := coll.Maps["print_stack_map"]
-	output, err := pwru.NewOutput(&flags, printSkbMap, printStackMap, addr2name, useKprobeMulti, btfSpec)
+	output, err := pwru.NewOutput(&flags, printSkbMap, printShinfoMap, printStackMap, addr2name, useKprobeMulti, btfSpec)
 	if err != nil {
 		log.Fatalf("Failed to create outputer: %s", err)
 	}
 	defer output.Close()
-	output.PrintHeader()
 
 	if !flags.OutputJson {
 		output.PrintHeader()

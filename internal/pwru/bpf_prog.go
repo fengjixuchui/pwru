@@ -8,9 +8,10 @@ import (
 	"fmt"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/btf"
 	"golang.org/x/sys/unix"
 )
+
+var errNotFound = errors.New("not found")
 
 type BpfProgName2Addr map[string]uint64
 
@@ -47,28 +48,25 @@ func getEntryFuncName(prog *ebpf.Program) (string, string, error) {
 		return "", "", fmt.Errorf("failed to get program info: %w", err)
 	}
 
-	id, ok := info.BTFID()
+	_, ok := info.BTFID()
 	if !ok {
-		return "", "", fmt.Errorf("bpf program %s does not have BTF", info.Name)
+		// FENTRY/FEXIT program can only be attached to another program
+		// annotated with BTF. So if the BTF ID is not found, it means
+		// the program is not annotated with BTF.
+		return "", "", errNotFound
 	}
 
-	handle, err := btf.NewHandleFromID(id)
+	insns, err := info.Instructions()
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get BTF handle: %w", err)
-	}
-	defer handle.Close()
-
-	spec, err := handle.Spec(nil)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get BTF spec: %w", err)
+		return "", "", fmt.Errorf("failed to get program instructions: %w", err)
 	}
 
-	iter := spec.Iterate()
-	for iter.Next() {
-		if fn, ok := iter.Type.(*btf.Func); ok {
-			return fn.Name, info.Name, nil
+	for _, insn := range insns {
+		sym := insn.Symbol()
+		if sym != "" {
+			return sym, info.Name, nil
 		}
 	}
 
-	return "", "", fmt.Errorf("no function found in %s bpf prog", info.Name)
+	return "", "", errNotFound
 }
