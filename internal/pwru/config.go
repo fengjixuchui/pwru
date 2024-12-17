@@ -22,12 +22,14 @@ const (
 	OutputShinfoMask
 	OutputStackMask
 	OutputCallerMask
+	OutputCbMask
 )
 
 const (
 	IsSetMask uint8 = 1 << iota
 	TrackSkbMask
 	TrackSkbByStackidMask
+	TrackXDPMask
 )
 
 // Version is the pwru version and is set at compile time via LDFLAGS-
@@ -40,6 +42,9 @@ type FilterCfg struct {
 
 	OutputFlags uint8
 	FilterFlags uint8
+
+	SkbBtfID    uint32
+	ShinfoBtfID uint32
 }
 
 func GetConfig(flags *Flags) (cfg FilterCfg, err error) {
@@ -65,11 +70,17 @@ func GetConfig(flags *Flags) (cfg FilterCfg, err error) {
 	if flags.OutputCaller {
 		cfg.OutputFlags |= OutputCallerMask
 	}
+	if flags.FilterTraceTc || flags.OutputSkbCB {
+		cfg.OutputFlags |= OutputCbMask
+	}
 	if flags.FilterTrackSkb {
 		cfg.FilterFlags |= TrackSkbMask
 	}
 	if flags.FilterTrackSkbByStackid {
 		cfg.FilterFlags |= TrackSkbByStackidMask
+	}
+	if flags.FilterTraceXdp {
+		cfg.FilterFlags |= TrackXDPMask
 	}
 
 	netnsID, ns, err := parseNetns(flags.FilterNetns)

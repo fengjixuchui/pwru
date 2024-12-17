@@ -20,7 +20,7 @@ after installing an IP tables rule:
 
 `pwru` requires >= 5.3 kernel to run. For `--output-skb` >= 5.9 kernel is required. For `--backend=kprobe-multi` >= 5.18 kernel is required.
 
-`debugfs` has to be mounted in `/sys/kernel/debug`. In case the folder is empty, it can be mounted with:
+`pwru` optionally requires `debugfs`. It has to be mounted in `/sys/kernel/debug`. In case the folder is empty, it can be mounted with:
 
 ```
 mount -t debugfs none /sys/kernel/debug
@@ -145,7 +145,7 @@ See [docs/vagrant.md](docs/vagrant.md)
 ### Dependencies
 
 * Go >= 1.16
-* LLVM/clang >= 1.12
+* LLVM/clang >= 12
 * Bison
 * Lex/Flex >= 2.5.31
 
@@ -174,7 +174,7 @@ their commit messages.
 
 ## Community
 
-Join the `#pwru` [Slack channel](https://cilium.herokuapp.com/) to chat with
+Join the `#pwru` [Slack channel](https://slack.cilium.io) to chat with
 developers, maintainers, and other users. This is a good first stop to ask
 questions and share your experiences.
 

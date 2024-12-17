@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -36,6 +37,11 @@ func main() {
 		fmt.Printf("pwru %s\n", pwru.Version)
 		os.Exit(0)
 	}
+	if flags.FilterTrackBpfHelpers {
+		if runtime.GOARCH != "amd64" {
+			log.Fatalf("BPF helpers tracking is only supported on amd64")
+		}
+	}
 
 	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &unix.Rlimit{
 		Cur: 8192,
@@ -59,6 +65,10 @@ func main() {
 	}
 	if err != nil {
 		log.Fatalf("Failed to load BTF spec: %s", err)
+	}
+
+	if (flags.OutputSkb || flags.OutputShinfo) && !pwru.HaveSnprintfBtf(btfSpec) {
+		log.Fatal("Unsupported to output skb or shinfo because bpf_snprintf_btf() is unavailable")
 	}
 
 	if flags.AllKMods {
@@ -99,7 +109,7 @@ func main() {
 	// prog's name.
 	addr2name, name2addr, err := pwru.ParseKallsyms(funcs, flags.OutputStack ||
 		len(flags.KMods) != 0 || flags.FilterTraceTc || flags.FilterTraceXdp ||
-		len(flags.FilterNonSkbFuncs) > 0 || flags.OutputCaller)
+		len(flags.FilterNonSkbFuncs) > 0 || flags.OutputCaller || flags.FilterTrackBpfHelpers)
 	if err != nil {
 		log.Fatalf("Failed to get function addrs: %s", err)
 	}
@@ -109,19 +119,19 @@ func main() {
 	opts.Programs.LogLevel = ebpf.LogLevelInstruction
 	opts.Programs.LogSize = ebpf.DefaultVerifierLogSize * 100
 
-	var bpfSpec *ebpf.CollectionSpec
-	switch {
-	case (flags.OutputSkb || flags.OutputShinfo) && useKprobeMulti:
-		bpfSpec, err = LoadKProbeMultiPWRU()
-	case flags.OutputSkb || flags.OutputShinfo:
-		bpfSpec, err = LoadKProbePWRU()
-	case useKprobeMulti:
-		bpfSpec, err = LoadKProbeMultiPWRUWithoutOutputSKB()
-	default:
-		bpfSpec, err = LoadKProbePWRUWithoutOutputSKB()
-	}
+	bpfSpec, err := LoadKProbePWRU()
 	if err != nil {
 		log.Fatalf("Failed to load bpf spec: %v", err)
+	}
+
+	if useKprobeMulti {
+		for i := 1; i <= 5; i++ {
+			delete(bpfSpec.Programs, fmt.Sprintf("kprobe_skb_%d", i))
+		}
+	} else {
+		for i := 1; i <= 5; i++ {
+			delete(bpfSpec.Programs, fmt.Sprintf("kprobe_multi_skb_%d", i))
+		}
 	}
 
 	for name, program := range bpfSpec.Programs {
@@ -131,7 +141,8 @@ func main() {
 			"fexit_skb_clone",
 			"fexit_skb_copy",
 			"kprobe_veth_convert_skb_to_xdp_buff",
-			"kretprobe_veth_convert_skb_to_xdp_buff":
+			"kretprobe_veth_convert_skb_to_xdp_buff",
+			"fexit_xdp":
 			continue
 		}
 		if name == "fentry_xdp" {
@@ -145,7 +156,18 @@ func main() {
 		}
 	}
 
+	skbBtfID, err := pwru.GetStructBtfID(btfSpec, "sk_buff")
+	if err != nil {
+		log.Fatalf("Failed to get BTF ID for sk_buff: %v", err)
+	}
+	shinfoBtfID, err := pwru.GetStructBtfID(btfSpec, "skb_shared_info")
+	if err != nil {
+		log.Fatalf("Failed to get BTF ID for skb_shared_info: %v", err)
+	}
+
 	pwruConfig, err := pwru.GetConfig(&flags)
+	pwruConfig.SkbBtfID = uint32(skbBtfID)
+	pwruConfig.ShinfoBtfID = uint32(shinfoBtfID)
 	if err != nil {
 		log.Fatalf("Failed to get pwru config: %v", err)
 	}
@@ -176,6 +198,7 @@ func main() {
 		bpfSpecFentryXdp = bpfSpec.Copy()
 		bpfSpecFentryXdp.Programs = map[string]*ebpf.ProgramSpec{
 			"fentry_xdp": bpfSpecFentryXdp.Programs["fentry_xdp"],
+			"fexit_xdp":  bpfSpecFentryXdp.Programs["fexit_xdp"],
 		}
 	}
 
@@ -183,6 +206,7 @@ func main() {
 	// they should be deleted from the spec.
 	delete(bpfSpec.Programs, "fentry_tc")
 	delete(bpfSpec.Programs, "fentry_xdp")
+	delete(bpfSpec.Programs, "fexit_xdp")
 
 	// If not tracking skb, deleting the skb-tracking programs to reduce loading
 	// time.
@@ -230,6 +254,14 @@ func main() {
 	if flags.FilterTrackSkb || flags.FilterTrackSkbByStackid {
 		t := pwru.TrackSkb(coll, haveFexit, flags.FilterTrackSkb)
 		defer t.Detach()
+	}
+
+	if flags.FilterTrackBpfHelpers {
+		bpfHelpers, err := pwru.GetBpfHelpers(addr2name)
+		if err != nil {
+			log.Fatalf("Failed to get bpf helpers: %s\n", err)
+		}
+		flags.FilterNonSkbFuncs = append(flags.FilterNonSkbFuncs, bpfHelpers...)
 	}
 
 	if nonSkbFuncs := flags.FilterNonSkbFuncs; len(nonSkbFuncs) != 0 {

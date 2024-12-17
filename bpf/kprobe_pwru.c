@@ -28,6 +28,7 @@
 
 
 const static bool TRUE = true;
+const static u32 ZERO = 0;
 
 volatile const static __u64 BPF_PROG_ADDR = 0;
 
@@ -35,6 +36,7 @@ enum {
 	TRACKED_BY_FILTER = (1 << 0),
 	TRACKED_BY_SKB = (1 << 1),
 	TRACKED_BY_STACKID = (1 << 2),
+	TRACKED_BY_XDP = (1 << 3),
 };
 
 union addr {
@@ -52,7 +54,7 @@ struct skb_meta {
 	u32 len;
 	u32 mtu;
 	u16 protocol;
-	u16 pad;
+	u32 cb[5];
 } __attribute__((packed));
 
 struct tuple {
@@ -65,9 +67,6 @@ struct tuple {
 	u8 pad;
 } __attribute__((packed));
 
-u64 print_skb_id = 0;
-u64 print_shinfo_id = 0;
-
 enum event_type {
 	EVENT_TYPE_KPROBE = 0,
 	EVENT_TYPE_TC     = 1,
@@ -79,14 +78,15 @@ struct event_t {
 	u32 type;
 	u64 addr;
 	u64 caller_addr;
-	u64 skb_head;
+	u64 skb_addr;
 	u64 ts;
-	typeof(print_skb_id) print_skb_id;
-	typeof(print_shinfo_id) print_shinfo_id;
+	u64 print_skb_id;
+	u64 print_shinfo_id;
 	struct skb_meta meta;
 	struct tuple tuple;
 	s64 print_stack_id;
 	u64 param_second;
+	u64 param_third;
 	u32 cpu_id;
 } __attribute__((packed));
 
@@ -103,7 +103,7 @@ struct {
 	__type(key, __u64);
 	__type(value, bool);
 	__uint(max_entries, MAX_TRACK_SIZE);
-} skb_heads SEC(".maps");
+} skb_addresses SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -126,6 +126,13 @@ struct {
 	__uint(max_entries, MAX_TRACK_SIZE);
 } stackid_skb SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u64);
+	__type(value, struct skb *);
+	__uint(max_entries, MAX_TRACK_SIZE);
+} xdp_dhs_skb_heads SEC(".maps");
+
 struct config {
 	u32 netns;
 	u32 mark;
@@ -136,11 +143,15 @@ struct config {
 	u8 output_shinfo: 1;
 	u8 output_stack: 1;
 	u8 output_caller: 1;
-	u8 output_unused: 2;
+	u8 output_cb: 1;
+	u8 output_unused: 1;
 	u8 is_set: 1;
 	u8 track_skb: 1;
 	u8 track_skb_by_stackid: 1;
-	u8 unused: 5;
+	u8 track_xdp: 1;
+	u8 unused: 4;
+	u32 skb_btf_id;
+	u32 shinfo_btf_id;
 } __attribute__((packed));
 
 static volatile const struct config CFG;
@@ -154,7 +165,6 @@ struct {
 	__uint(value_size, MAX_STACK_DEPTH * sizeof(u64));
 } print_stack_map SEC(".maps");
 
-#ifdef OUTPUT_SKB
 struct print_skb_value {
 	u32 len;
 	char str[PRINT_SKB_STR_SIZE];
@@ -164,18 +174,29 @@ struct print_shinfo_value {
 	char str[PRINT_SHINFO_STR_SIZE];
 };
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 256);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
 	__type(key, u32);
+	__type(value, u32);
+} print_skb_id_map SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, u64);
 	__type(value, struct print_skb_value);
 } print_skb_map SEC(".maps");
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 256);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
 	__type(key, u32);
+	__type(value, u32);
+} print_shinfo_id_map SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, u64);
 	__type(value, struct print_shinfo_value);
 } print_shinfo_map SEC(".maps");
-#endif
 
 static __always_inline u32
 get_netns(struct sk_buff *skb) {
@@ -312,45 +333,39 @@ set_tuple(struct sk_buff *skb, struct tuple *tpl) {
 	__set_tuple(tpl, skb_head, l3_off, is_ipv4);
 }
 
-
-static __always_inline void
-set_skb_btf(struct sk_buff *skb, typeof(print_skb_id) *event_id) {
-#ifdef OUTPUT_SKB
-	static struct btf_ptr p = {};
-	struct print_skb_value *v;
-	typeof(print_skb_id) id;
-	long n;
-
-	p.type_id = bpf_core_type_id_kernel(struct sk_buff);
-	p.ptr = skb;
-	id = __sync_fetch_and_add(&print_skb_id, 1) % 256;
-
-	v = bpf_map_lookup_elem(&print_skb_map, (u32 *) &id);
-	if (!v) {
-		return;
-	}
-
-	n = bpf_snprintf_btf(v->str, PRINT_SKB_STR_SIZE, &p, sizeof(p), 0);
-	if (n < 0) {
-		return;
-	}
-
-	v->len = n;
-
-	*event_id = id;
-#endif
+static __always_inline u64
+sync_fetch_and_add(void *id_map) {
+	u32 *id = bpf_map_lookup_elem(id_map, &ZERO);
+	if (id)
+		return ((*id)++) | ((u64)bpf_get_smp_processor_id() << 32);
+	return 0;
 }
 
 static __always_inline void
-set_shinfo_btf(struct sk_buff *skb, typeof(print_shinfo_id) *event_id) {
-#ifdef OUTPUT_SKB
+set_skb_btf(struct sk_buff *skb, u64 *event_id) {
+	static struct btf_ptr p = {};
+	static struct print_skb_value v = {};
+	u64 id;
+
+	p.type_id = cfg->skb_btf_id;
+	p.ptr = skb;
+	*event_id = sync_fetch_and_add(&print_skb_id_map);
+
+	v.len = bpf_snprintf_btf(v.str, PRINT_SKB_STR_SIZE, &p, sizeof(p), 0);
+	if (v.len < 0) {
+		return;
+	}
+
+	bpf_map_update_elem(&print_skb_map, event_id, &v, BPF_ANY);
+}
+
+static __always_inline void
+set_shinfo_btf(struct sk_buff *skb, u64 *event_id) {
 	struct skb_shared_info *shinfo;
 	static struct btf_ptr p = {};
-	struct print_shinfo_value *v;
-	typeof(print_shinfo_id) id;
+	static struct print_shinfo_value v = {};
 	unsigned char *head;
 	unsigned int end;
-	long n;
 
         /* skb_shared_info is located at the end of skb data.
          * When CONFIG_NET_SKBUFF_DATA_USES_OFFSET is enabled, skb->end
@@ -363,31 +378,39 @@ set_shinfo_btf(struct sk_buff *skb, typeof(print_shinfo_id) *event_id) {
 	end = BPF_CORE_READ(skb, end);
 	shinfo = (struct skb_shared_info *)(head + end);
 
-	p.type_id = bpf_core_type_id_kernel(struct skb_shared_info);
+	p.type_id = cfg->shinfo_btf_id;
 	p.ptr = shinfo;
 
-	id = __sync_fetch_and_add(&print_shinfo_id, 1) % 256;
+	*event_id = sync_fetch_and_add(&print_shinfo_id_map);
 
-	v = bpf_map_lookup_elem(&print_shinfo_map, (u32 *) &id);
-	if (!v) {
+	v.len = bpf_snprintf_btf(v.str, PRINT_SHINFO_STR_SIZE, &p, sizeof(p), 0);
+	if (v.len < 0) {
 		return;
 	}
 
-	n = bpf_snprintf_btf(v->str, PRINT_SHINFO_STR_SIZE, &p, sizeof(p), 0);
-	if (n < 0) {
-		return;
-	}
-
-	v->len = n;
-
-	*event_id = id;
-#endif
+	bpf_map_update_elem(&print_shinfo_map, event_id, &v, BPF_ANY);
 }
 
 static __always_inline u64
-get_stackid(struct pt_regs *ctx) {
+get_tracing_fp(void)
+{
+	u64 fp;
+
+	/* get frame pointer */
+	asm volatile ("%[fp] = r10" : [fp] "+r"(fp) :);
+	return fp;
+}
+
+static __always_inline u64
+get_kprobe_fp(struct pt_regs *ctx)
+{
+	return PT_REGS_FP(ctx);
+}
+
+static __always_inline u64
+get_stackid(void *ctx, const bool is_kprobe) {
 	u64 caller_fp;
-	u64 fp = PT_REGS_FP(ctx);
+	u64 fp = is_kprobe ? get_kprobe_fp(ctx) : get_tracing_fp();
 	for (int depth = 0; depth < MAX_STACK_DEPTH; depth++) {
 		if (bpf_probe_read_kernel(&caller_fp, sizeof(caller_fp), (void *)fp) < 0)
 			break;
@@ -421,19 +444,33 @@ set_output(void *ctx, struct sk_buff *skb, struct event_t *event) {
 	if (cfg->output_stack) {
 		event->print_stack_id = bpf_get_stackid(ctx, &print_stack_map, BPF_F_FAST_STACK_CMP);
 	}
+
+	if (cfg->output_cb) {
+		struct qdisc_skb_cb *cb = (struct qdisc_skb_cb *)&skb->cb;
+		bpf_probe_read_kernel(&event->meta.cb, sizeof(event->meta.cb), (void *)&cb->data);
+	}
 }
 
 static __noinline bool
-handle_everything(struct sk_buff *skb, void *ctx, struct event_t *event, u64 *_stackid) {
+handle_everything(struct sk_buff *skb, void *ctx, struct event_t *event, u64 *_stackid, const bool is_kprobe) {
 	u8 tracked_by;
+	u64 skb_addr = (u64) skb;
 	u64 skb_head = (u64) BPF_CORE_READ(skb, head);
 	u64 stackid;
 
 	if (cfg->track_skb_by_stackid)
-		stackid = _stackid ? *_stackid : get_stackid(ctx);
+		stackid = _stackid ? *_stackid : get_stackid(ctx, is_kprobe);
 
 	if (cfg->is_set) {
-		if (cfg->track_skb && bpf_map_lookup_elem(&skb_heads, &skb_head)) {
+		if (cfg->track_xdp && cfg->track_skb) {
+			if (bpf_map_lookup_elem(&xdp_dhs_skb_heads, &skb_head)) {
+				tracked_by = TRACKED_BY_XDP;
+				bpf_map_delete_elem(&xdp_dhs_skb_heads, &skb_head);
+				goto cont;
+			}
+		}
+
+		if (cfg->track_skb && bpf_map_lookup_elem(&skb_addresses, &skb_addr)) {
 			tracked_by = _stackid ? TRACKED_BY_STACKID : TRACKED_BY_SKB;
 			goto cont;
 		}
@@ -455,7 +492,9 @@ cont:
 	}
 
 	if (cfg->track_skb && tracked_by == TRACKED_BY_FILTER) {
-		bpf_map_update_elem(&skb_heads, &skb_head, &TRUE, BPF_ANY);
+		bpf_map_update_elem(&skb_addresses, &skb_addr, &TRUE, BPF_ANY);
+		if (cfg->track_xdp)
+			bpf_map_update_elem(&xdp_dhs_skb_heads, &skb_head, &skb_addr, BPF_ANY);
 	}
 
 	if (cfg->track_skb_by_stackid && tracked_by != TRACKED_BY_STACKID) {
@@ -475,15 +514,16 @@ cont:
 }
 
 static __always_inline int
-kprobe_skb(struct sk_buff *skb, struct pt_regs *ctx, bool has_get_func_ip, u64 *_stackid) {
+kprobe_skb(struct sk_buff *skb, struct pt_regs *ctx, const bool has_get_func_ip, u64 *_stackid) {
 	struct event_t event = {};
 
-	if (!handle_everything(skb, ctx, &event, _stackid))
+	if (!handle_everything(skb, ctx, &event, _stackid, true))
 		return BPF_OK;
 
-	event.skb_head = (u64) BPF_CORE_READ(skb, head);
+	event.skb_addr = (u64) skb;
 	event.addr = has_get_func_ip ? bpf_get_func_ip(ctx) : PT_REGS_IP(ctx);
 	event.param_second = PT_REGS_PARM2(ctx);
+	event.param_third = PT_REGS_PARM3(ctx);
 	if (CFG.output_caller)
 		bpf_probe_read_kernel(&event.caller_addr, sizeof(event.caller_addr), (void *)PT_REGS_SP(ctx));
 
@@ -492,19 +532,17 @@ kprobe_skb(struct sk_buff *skb, struct pt_regs *ctx, bool has_get_func_ip, u64 *
 	return BPF_OK;
 }
 
-#ifdef HAS_KPROBE_MULTI
-#define PWRU_KPROBE_TYPE "kprobe.multi"
-#define PWRU_HAS_GET_FUNC_IP true
-#else
-#define PWRU_KPROBE_TYPE "kprobe"
-#define PWRU_HAS_GET_FUNC_IP false
-#endif /* HAS_KPROBE_MULTI */
-
-#define PWRU_ADD_KPROBE(X)                                                     \
-  SEC(PWRU_KPROBE_TYPE "/skb-" #X)                                             \
-  int kprobe_skb_##X(struct pt_regs *ctx) {                                    \
-    struct sk_buff *skb = (struct sk_buff *) PT_REGS_PARM##X(ctx);             \
-    return kprobe_skb(skb, ctx, PWRU_HAS_GET_FUNC_IP, NULL);                         \
+#define PWRU_ADD_KPROBE(X)                                                  \
+  SEC("kprobe/skb-" #X)                                                     \
+  int kprobe_skb_##X(struct pt_regs *ctx) {                                 \
+    struct sk_buff *skb = (struct sk_buff *) PT_REGS_PARM##X(ctx);          \
+    return kprobe_skb(skb, ctx, false, NULL);                               \
+  }                                                                         \
+                                                                            \
+  SEC("kprobe.multi/skb-" #X)                                               \
+  int kprobe_multi_skb_##X(struct pt_regs *ctx) {                           \
+    struct sk_buff *skb = (struct sk_buff *) PT_REGS_PARM##X(ctx);          \
+    return kprobe_skb(skb, ctx, true, NULL);                                \
   }
 
 PWRU_ADD_KPROBE(1)
@@ -513,32 +551,30 @@ PWRU_ADD_KPROBE(3)
 PWRU_ADD_KPROBE(4)
 PWRU_ADD_KPROBE(5)
 
+#undef PWRU_ADD_KPROBE
+
 SEC("kprobe/skb_by_stackid")
 int kprobe_skb_by_stackid(struct pt_regs *ctx) {
-	u64 stackid = get_stackid(ctx);
+	u64 stackid = get_stackid(ctx, true);
 
 	struct sk_buff **skb = bpf_map_lookup_elem(&stackid_skb, &stackid);
 	if (skb && *skb)
-		return kprobe_skb(*skb, ctx, PWRU_HAS_GET_FUNC_IP, &stackid);
+		return kprobe_skb(*skb, ctx, false, &stackid);
 
 	return BPF_OK;
 }
 
-#undef PWRU_KPROBE
-#undef PWRU_HAS_GET_FUNC_IP
-#undef PWRU_KPROBE_TYPE
-
 SEC("kprobe/skb_lifetime_termination")
 int kprobe_skb_lifetime_termination(struct pt_regs *ctx) {
 	struct sk_buff *skb = (typeof(skb)) PT_REGS_PARM1(ctx);
-	u64 skb_head = (u64) BPF_CORE_READ(skb, head);
+	u64 skb_addr = (u64) skb;
 
-	bpf_map_delete_elem(&skb_heads, &skb_head);
+	bpf_map_delete_elem(&skb_addresses, &skb_addr);
 
 	if (cfg->track_skb_by_stackid) {
-		u64 stackid = get_stackid(ctx);
+		u64 stackid = get_stackid(ctx, true);
 		bpf_map_delete_elem(&stackid_skb, &stackid);
-		bpf_map_delete_elem(&skb_stackid, &skb_head);
+		bpf_map_delete_elem(&skb_stackid, &skb_addr);
 	}
 
 	return BPF_OK;
@@ -546,10 +582,10 @@ int kprobe_skb_lifetime_termination(struct pt_regs *ctx) {
 
 static __always_inline int
 track_skb_clone(struct sk_buff *old, struct sk_buff *new) {
-	u64 skb_addr_old = (u64) BPF_CORE_READ(old, head);
-	u64 skb_addr_new = (u64) BPF_CORE_READ(new, head);
-	if (bpf_map_lookup_elem(&skb_heads, &skb_addr_old))
-		bpf_map_update_elem(&skb_heads, &skb_addr_new, &TRUE, BPF_ANY);
+	u64 skb_addr_old = (u64) old;
+	u64 skb_addr_new = (u64) new;
+	if (bpf_map_lookup_elem(&skb_addresses, &skb_addr_old))
+		bpf_map_update_elem(&skb_addresses, &skb_addr_new, &TRUE, BPF_ANY);
 
 	return BPF_OK;
 }
@@ -574,10 +610,10 @@ SEC("fentry/tc")
 int BPF_PROG(fentry_tc, struct sk_buff *skb) {
 	struct event_t event = {};
 
-	if (!handle_everything(skb, ctx, &event, NULL))
+	if (!handle_everything(skb, ctx, &event, NULL, false))
 		return BPF_OK;
 
-	event.skb_head = (u64) BPF_CORE_READ(skb, head);
+	event.skb_addr = (u64) skb;
 	event.addr = BPF_PROG_ADDR;
 	event.type = EVENT_TYPE_TC;
 	bpf_map_push_elem(&events, &event, BPF_EXIST);
@@ -663,33 +699,40 @@ set_xdp_output(void *ctx, struct xdp_buff *xdp, struct event_t *event) {
 
 SEC("fentry/xdp")
 int BPF_PROG(fentry_xdp, struct xdp_buff *xdp) {
-	u64 skb_head = (u64) BPF_CORE_READ(xdp, data_hard_start);
 	struct event_t event = {};
+	u64 xdp_dhs = (u64) BPF_CORE_READ(xdp, data_hard_start);
 
 	if (cfg->is_set) {
-		if (cfg->track_skb) {
-			if (!bpf_map_lookup_elem(&skb_heads, &skb_head)) {
-				if (!filter_xdp(xdp))
-					return BPF_OK;
-
-				bpf_map_update_elem(&skb_heads, &skb_head, &TRUE, BPF_ANY);
-			}
-
-		} else if (!filter_xdp(xdp)) {
-			return BPF_OK;
+		if (cfg->track_skb && bpf_map_lookup_elem(&xdp_dhs_skb_heads, &xdp_dhs)) {
+			bpf_map_delete_elem(&xdp_dhs_skb_heads, &xdp_dhs);
+			goto cont;
 		}
 
+		if (filter_xdp(xdp)) {
+			goto cont;
+		}
+
+		return BPF_OK;
+
+cont:
 		set_xdp_output(ctx, xdp, &event);
 	}
 
 	event.pid = bpf_get_current_pid_tgid() >> 32;
 	event.ts = bpf_ktime_get_ns();
 	event.cpu_id = bpf_get_smp_processor_id();
-	event.skb_head = (u64) skb_head;
+	event.skb_addr = (u64) &xdp;
 	event.addr = BPF_PROG_ADDR;
 	event.type = EVENT_TYPE_XDP;
 	bpf_map_push_elem(&events, &event, BPF_EXIST);
 
+	return BPF_OK;
+}
+
+SEC("fexit/xdp")
+int BPF_PROG(fexit_xdp, struct xdp_buff *xdp) {
+	u64 xdp_dhs = (u64) BPF_CORE_READ(xdp, data_hard_start);
+	bpf_map_update_elem(&xdp_dhs_skb_heads, &xdp_dhs, &xdp, BPF_ANY);
 	return BPF_OK;
 }
 
@@ -698,8 +741,8 @@ int kprobe_veth_convert_skb_to_xdp_buff(struct pt_regs *ctx) {
 	struct sk_buff **pskb = (struct sk_buff **)PT_REGS_PARM3(ctx);
 	struct sk_buff *skb;
 	bpf_probe_read_kernel(&skb, sizeof(skb), (void *)pskb);
-	u64 skb_head = (u64) BPF_CORE_READ(skb, head);
-	if (bpf_map_lookup_elem(&skb_heads, &skb_head)) {
+	u64 skb_addr = (u64) skb;
+	if (bpf_map_lookup_elem(&skb_addresses, &skb_addr)) {
 		u64 pid_tgid = bpf_get_current_pid_tgid();
 		bpf_map_update_elem(&veth_skbs, &pid_tgid, &pskb, BPF_ANY);
 	}
@@ -713,8 +756,8 @@ int kretprobe_veth_convert_skb_to_xdp_buff(struct pt_regs *ctx) {
 	if (pskb && *pskb) {
 		struct sk_buff *skb;
 		bpf_probe_read_kernel(&skb, sizeof(skb), (void *)*pskb);
-		u64 skb_head = (u64) BPF_CORE_READ(skb, head);
-		bpf_map_update_elem(&skb_heads, &skb_head, &TRUE, BPF_ANY);
+		u64 skb_addr = (u64) skb;
+		bpf_map_update_elem(&skb_addresses, &skb_addr, &TRUE, BPF_ANY);
 		bpf_map_delete_elem(&veth_skbs, &pid_tgid);
 	}
 	return BPF_OK;

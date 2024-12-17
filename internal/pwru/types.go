@@ -7,7 +7,6 @@ package pwru
 import (
 	"fmt"
 	"os"
-	"slices"
 	"strings"
 
 	flag "github.com/spf13/pflag"
@@ -34,6 +33,7 @@ type Flags struct {
 	FilterTrackSkbByStackid bool
 	FilterTraceTc           bool
 	FilterTraceXdp          bool
+	FilterTrackBpfHelpers   bool
 	FilterIfname            string
 	FilterPcap              string
 	FilterKprobeBatch       uint
@@ -46,6 +46,7 @@ type Flags struct {
 	OutputStack      bool
 	OutputCaller     bool
 	OutputLimitLines uint64
+	OutputSkbCB      bool
 	OutputFile       string
 	OutputJson       bool
 
@@ -71,16 +72,18 @@ func (f *Flags) SetFlags() {
 	flag.BoolVar(&f.FilterTrackSkbByStackid, "filter-track-skb-by-stackid", false, "trace a packet even after it is kfreed (e.g., traffic going through bridge)")
 	flag.BoolVar(&f.FilterTraceTc, "filter-trace-tc", false, "trace TC bpf progs")
 	flag.BoolVar(&f.FilterTraceXdp, "filter-trace-xdp", false, "trace XDP bpf progs")
+	flag.BoolVar(&f.FilterTrackBpfHelpers, "filter-track-bpf-helpers", false, "trace BPF helper functions")
 	flag.StringVar(&f.FilterIfname, "filter-ifname", "", "filter skb ifname in --filter-netns (if not specified, use current netns)")
 	flag.UintVar(&f.FilterKprobeBatch, "filter-kprobe-batch", 10, "batch size for kprobe attaching/detaching")
 	flag.StringVar(&f.OutputTS, "timestamp", "none", "print timestamp per skb (\"current\", \"relative\", \"absolute\", \"none\")")
-	flag.BoolVar(&f.OutputMeta, "output-meta", false, "print skb metadata")
-	flag.BoolVar(&f.OutputTuple, "output-tuple", false, "print L4 tuple")
+	flag.BoolVar(&f.OutputMeta, "output-meta", true, "print skb metadata")
+	flag.BoolVar(&f.OutputTuple, "output-tuple", true, "print L4 tuple")
 	flag.BoolVar(&f.OutputSkb, "output-skb", false, "print skb")
 	flag.BoolVar(&f.OutputShinfo, "output-skb-shared-info", false, "print skb shared info")
 	flag.BoolVar(&f.OutputStack, "output-stack", false, "print stack")
 	flag.BoolVar(&f.OutputCaller, "output-caller", false, "print caller function name")
 	flag.Uint64Var(&f.OutputLimitLines, "output-limit-lines", 0, "exit the program after the number of events has been received/printed")
+	flag.BoolVar(&f.OutputSkbCB, "output-skb-cb", false, "print skb->cb")
 
 	flag.StringVar(&f.OutputFile, "output-file", "", "write traces to file")
 
@@ -107,10 +110,8 @@ func (f *Flags) PrintHelp() {
 func (f *Flags) Parse() {
 	flag.Parse()
 	f.FilterPcap = strings.Join(flag.Args(), " ")
-	if len(f.FilterNonSkbFuncs) > 0 {
+	if len(f.FilterNonSkbFuncs) > 0 || f.FilterTrackBpfHelpers {
 		f.FilterTrackSkbByStackid = true
-		slices.Sort(f.FilterNonSkbFuncs)
-		f.FilterNonSkbFuncs = slices.Compact(f.FilterNonSkbFuncs)
 	}
 }
 
@@ -131,7 +132,7 @@ type Meta struct {
 	Len     uint32
 	MTU     uint32
 	Proto   uint16
-	Pad     uint16
+	Cb      [5]uint32
 }
 
 type StackData struct {
@@ -143,7 +144,7 @@ type Event struct {
 	Type          uint32
 	Addr          uint64
 	CallerAddr    uint64
-	SkbHead       uint64
+	SkbAddr       uint64
 	Timestamp     uint64
 	PrintSkbId    uint64
 	PrintShinfoId uint64
@@ -151,5 +152,6 @@ type Event struct {
 	Tuple         Tuple
 	PrintStackId  int64
 	ParamSecond   uint64
+	ParamThird    uint64
 	CPU           uint32
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"sync"
 
 	"github.com/cilium/ebpf"
@@ -64,7 +65,7 @@ func (t *tracing) traceProg(spec *ebpf.CollectionSpec,
 	opts *ebpf.CollectionOptions, prog *ebpf.Program, n2a BpfProgName2Addr,
 	tracingName string,
 ) error {
-	entryFn, name, err := getEntryFuncName(prog)
+	entryFn, progName, tag, err := getBpfProgInfo(prog)
 	if err != nil {
 		if errors.Is(err, errNotFound) {
 			log.Printf("Skip tracing bpf prog %s because cannot find its entry function name", prog)
@@ -80,11 +81,13 @@ func (t *tracing) traceProg(spec *ebpf.CollectionSpec,
 	// distinguish which exact bpf prog is called.
 	//   -- @jschwinger233
 
-	addr, ok := n2a[entryFn]
+	progKsym := fmt.Sprintf("bpf_prog_%s_%s[bpf]", tag, entryFn)
+	addr, ok := n2a[progKsym]
 	if !ok {
-		addr, ok = n2a[name]
+		progKsym = fmt.Sprintf("bpf_prog_%s_%s[bpf]", tag, progName)
+		addr, ok = n2a[progKsym]
 		if !ok {
-			return fmt.Errorf("failed to find address for function %s of bpf prog %v", name, prog)
+			return fmt.Errorf("failed to find address for function %s of bpf prog %v", progName, prog)
 		}
 	}
 
@@ -125,29 +128,13 @@ func (t *tracing) traceProg(spec *ebpf.CollectionSpec,
 
 func (t *tracing) trace(coll *ebpf.Collection, spec *ebpf.CollectionSpec,
 	opts *ebpf.CollectionOptions, outputSkb bool, outputShinfo bool,
-	n2a BpfProgName2Addr, progType ebpf.ProgramType, tracingName string,
+	n2a BpfProgName2Addr, progs []*ebpf.Program, tracingName string,
 ) error {
-	progs, err := listBpfProgs(progType)
-	if err != nil {
-		return fmt.Errorf("failed to list bpf progs: %w", err)
-	}
-
 	// Reusing maps from previous collection is to handle the events together
 	// with the kprobes.
-	replacedMaps := map[string]*ebpf.Map{
-		"events":          coll.Maps["events"],
-		"print_stack_map": coll.Maps["print_stack_map"],
-	}
-	if outputSkb {
-		replacedMaps["print_skb_map"] = coll.Maps["print_skb_map"]
-	}
-	if outputShinfo {
-		replacedMaps["print_shinfo_map"] = coll.Maps["print_shinfo_map"]
-	}
+	replacedMaps := maps.Clone(coll.Maps)
+	delete(replacedMaps, ".rodata")
 	opts.MapReplacements = replacedMaps
-
-	t.links = make([]link.Link, 0, len(progs))
-	t.progs = progs
 
 	var errg errgroup.Group
 
@@ -172,8 +159,16 @@ func TraceTC(coll *ebpf.Collection, spec *ebpf.CollectionSpec,
 ) *tracing {
 	log.Printf("Attaching tc-bpf progs...\n")
 
+	progs, err := listBpfProgs(ebpf.SchedCLS)
+	if err != nil {
+		log.Fatalf("failed to list tc-bpf progs: %v", err)
+	}
+
 	var t tracing
-	if err := t.trace(coll, spec, opts, outputSkb, outputShinfo, n2a, ebpf.SchedCLS, "fentry_tc"); err != nil {
+	t.progs = progs
+	t.links = make([]link.Link, 0, len(progs))
+
+	if err := t.trace(coll, spec, opts, outputSkb, outputShinfo, n2a, progs, "fentry_tc"); err != nil {
 		log.Fatalf("failed to trace TC progs: %v", err)
 	}
 
@@ -186,9 +181,29 @@ func TraceXDP(coll *ebpf.Collection, spec *ebpf.CollectionSpec,
 ) *tracing {
 	log.Printf("Attaching xdp progs...\n")
 
+	progs, err := listBpfProgs(ebpf.XDP)
+	if err != nil {
+		log.Fatalf("failed to list XDP progs: %v", err)
+	}
+
 	var t tracing
-	if err := t.trace(coll, spec, opts, outputSkb, outputShinfo, n2a, ebpf.XDP, "fentry_xdp"); err != nil {
-		log.Fatalf("failed to trace XDP progs: %v", err)
+	t.progs = progs
+	t.links = make([]link.Link, 0, len(progs)*2)
+
+	{
+		spec := spec.Copy()
+		delete(spec.Programs, "fexit_xdp")
+		if err := t.trace(coll, spec, opts, outputSkb, outputShinfo, n2a, progs, "fentry_xdp"); err != nil {
+			log.Fatalf("failed to trace XDP progs: %v", err)
+		}
+	}
+
+	{
+		spec := spec.Copy()
+		delete(spec.Programs, "fentry_xdp")
+		if err := t.trace(coll, spec, opts, outputSkb, outputShinfo, n2a, progs, "fexit_xdp"); err != nil {
+			log.Fatalf("failed to trace XDP progs: %v", err)
+		}
 	}
 
 	return &t
